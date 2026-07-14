@@ -3,8 +3,9 @@ import time
 import math
 import atexit
 import threading
+import socket
 from collections import deque
-from flask import Flask, Response
+from flask import Flask, Response, request
 import mediapipe as mp
 
 # 1. Initialize Flask Web Server
@@ -112,6 +113,16 @@ def calculate_ear(landmarks, top_bottom_idx, left_right_idx):
     if dist_h == 0:
         return 0
     return dist_v / dist_h
+
+
+def get_lan_ip():
+    """Best-effort local IP address for remote-device access."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.connect(("8.8.8.8", 80))
+            return sock.getsockname()[0]
+    except OSError:
+        return "127.0.0.1"
 
 
 def capture_loop():
@@ -229,6 +240,8 @@ def video_feed():
 @app.route('/')
 def index():
     """The landing dashboard interface for the fleet manager."""
+    base_url = request.host_url.rstrip("/")
+    lan_ip = get_lan_ip()
     return """
     <html>
       <head>
@@ -242,15 +255,20 @@ def index():
         </style>
       </head>
       <body>
-        <div class="container">
-          <h1>Fleet AI Remote Telemetry</h1>
-          <p>Live Monitoring Feed (Device: Laptop B Webcam)</p>
-          <img src="/video_feed" />
-        </div>
-      </body>
-    </html>
-    """
+                <div class="container">
+                    <h1>Fleet AI Remote Telemetry</h1>
+                    <p>Live Monitoring Feed (Device: Laptop B Webcam)</p>
+                    <p>Open this on another device: {base_url}</p>
+                    <p>LAN IP: {lan_ip}</p>
+                    <img src="/video_feed" />
+                </div>
+            </body>
+        </html>
+        """.format(base_url=base_url, lan_ip=lan_ip)
+
 
 if __name__ == '__main__':
-    # Launch server on port 5000, accessible to all machines on the local Wi-Fi network
-    app.run(host='0.0.0.0', port=5000, debug=False, threaded=True)
+        # Launch server on port 5000, accessible to all machines on the local Wi-Fi network
+        print("Server running on http://0.0.0.0:5000")
+        print(f"Try http://{get_lan_ip()}:5000 from another device on the same network")
+        app.run(host='0.0.0.0', port=5000, debug=False, threaded=True)
