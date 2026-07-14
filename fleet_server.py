@@ -5,7 +5,7 @@ import atexit
 import threading
 import socket
 from collections import deque
-from flask import Flask, Response, request
+from flask import Flask, Response, jsonify, request
 import mediapipe as mp
 
 # 1. Initialize Flask Web Server
@@ -18,12 +18,33 @@ cap = None
 frame_width = 640
 frame_height = 480
 fps = 20
+STREAM_WIDTH = 640
+STREAM_HEIGHT = 360
+PROCESSING_SCALE = 0.5
+JPEG_QUALITY = 70
+ANALYSIS_INTERVAL = 3
 frame_buffer = deque(maxlen=fps * 5)
 latest_frame_bytes = None
 capture_thread = None
 capture_running = False
 stream_lock = threading.Lock()
 frame_ready = threading.Condition(stream_lock)
+analysis_frame_count = 0
+
+
+def build_placeholder_frame():
+    """Create a lightweight frame so streaming clients receive bytes immediately."""
+    frame = cv2.cvtColor(
+        cv2.resize(
+            cv2.UMat(90, 160, cv2.CV_8UC3, (20, 20, 20)).get(),
+            (STREAM_WIDTH, STREAM_HEIGHT)
+        ),
+        cv2.COLOR_BGR2RGB
+    )
+    cv2.putText(frame, "Starting camera feed...", (20, STREAM_HEIGHT // 2),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
+    ret, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
+    return buffer.tobytes() if ret else b""
 
 
 def initialize_stream_resources():
@@ -36,6 +57,10 @@ def initialize_stream_resources():
             cap.release()
             cap = None
             raise RuntimeError("Unable to open camera 0")
+
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, STREAM_WIDTH)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, STREAM_HEIGHT)
 
         frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 640
         frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 480
@@ -127,7 +152,7 @@ def get_lan_ip():
 
 def capture_loop():
     """Read frames, run detection, and publish the latest encoded JPEG for all clients."""
-    global drowsy_counter, alert_active, latest_frame_bytes
+    global drowsy_counter, alert_active, latest_frame_bytes, analysis_frame_count
 
     while capture_running and cap is not None and cap.isOpened():
         success, frame = cap.read()
@@ -137,30 +162,34 @@ def capture_loop():
         # Store clean frame in the rolling incident buffer.
         frame_buffer.append(frame.copy())
 
-        # Convert BGR image to RGB for MediaPipe processing.
-        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        results = face_mesh.process(rgb_frame)
-
         is_drowsy_this_frame = False
+        analysis_frame_count = (analysis_frame_count + 1) % ANALYSIS_INTERVAL
 
-        if results.multi_face_landmarks:
-            for face_landmarks in results.multi_face_landmarks:
-                landmarks = face_landmarks.landmark
+        if analysis_frame_count == 0:
+            processing_frame = cv2.resize(frame, None, fx=PROCESSING_SCALE, fy=PROCESSING_SCALE)
 
-                # Calculate EAR for both eyes.
-                left_ear = calculate_ear(landmarks, LEFT_EYE_TOP_BOTTOM, LEFT_EYE_LEFT_RIGHT)
-                right_ear = calculate_ear(landmarks, RIGHT_EYE_TOP_BOTTOM, RIGHT_EYE_LEFT_RIGHT)
-                avg_ear = (left_ear + right_ear) / 2.0
+            # Convert BGR image to RGB for MediaPipe processing.
+            rgb_frame = cv2.cvtColor(processing_frame, cv2.COLOR_BGR2RGB)
+            results = face_mesh.process(rgb_frame)
 
-                # Draw visual markers on the eyelids for debugging.
-                for idx in LEFT_EYE_TOP_BOTTOM + LEFT_EYE_LEFT_RIGHT + RIGHT_EYE_TOP_BOTTOM + RIGHT_EYE_LEFT_RIGHT:
-                    pt = landmarks[idx]
-                    cx, cy = int(pt.x * frame_width), int(pt.y * frame_height)
-                    cv2.circle(frame, (cx, cy), 2, (0, 255, 0), -1)
+            if results.multi_face_landmarks:
+                for face_landmarks in results.multi_face_landmarks:
+                    landmarks = face_landmarks.landmark
 
-                # Check if eyes are shut.
-                if avg_ear < EAR_THRESHOLD:
-                    is_drowsy_this_frame = True
+                    # Calculate EAR for both eyes.
+                    left_ear = calculate_ear(landmarks, LEFT_EYE_TOP_BOTTOM, LEFT_EYE_LEFT_RIGHT)
+                    right_ear = calculate_ear(landmarks, RIGHT_EYE_TOP_BOTTOM, RIGHT_EYE_LEFT_RIGHT)
+                    avg_ear = (left_ear + right_ear) / 2.0
+
+                    # Draw visual markers on the eyelids for debugging.
+                    for idx in LEFT_EYE_TOP_BOTTOM + LEFT_EYE_LEFT_RIGHT + RIGHT_EYE_TOP_BOTTOM + RIGHT_EYE_LEFT_RIGHT:
+                        pt = landmarks[idx]
+                        cx, cy = int(pt.x * frame_width), int(pt.y * frame_height)
+                        cv2.circle(frame, (cx, cy), 2, (0, 255, 0), -1)
+
+                    # Check if eyes are shut.
+                    if avg_ear < EAR_THRESHOLD:
+                        is_drowsy_this_frame = True
 
         # Update alert state machine.
         if is_drowsy_this_frame:
@@ -195,7 +224,7 @@ def capture_loop():
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
 
         # Compress the frame into JPEG format for network streaming.
-        ret, buffer = cv2.imencode('.jpg', frame)
+        ret, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
         if not ret:
             continue
 
@@ -210,7 +239,10 @@ def generate_frames():
     """Yield the latest published JPEG frame to each connected client."""
     initialize_stream_resources()
 
-    last_frame = None
+    last_frame = build_placeholder_frame()
+    yield (b'--frame\r\n'
+           b'Content-Type: image/jpeg\r\n\r\n' + last_frame + b'\r\n')
+
     while capture_running:
         with frame_ready:
             frame_ready.wait_for(lambda: not capture_running or latest_frame_bytes is not None and latest_frame_bytes != last_frame, timeout=1.0)
@@ -235,14 +267,24 @@ def video_feed():
     except RuntimeError as exc:
         return Response(str(exc), status=503, mimetype='text/plain')
 
-    return Response(generate_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
+    response = Response(generate_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
+    response.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0'
+    response.headers['Pragma'] = 'no-cache'
+    response.headers['X-Accel-Buffering'] = 'no'
+    return response
+
+
+@app.route('/alert_status')
+def alert_status():
+    """Expose the current distraction alert state for the dashboard."""
+    return jsonify({"alert_active": alert_active, "drowsy_counter": drowsy_counter})
 
 @app.route('/')
 def index():
     """The landing dashboard interface for the fleet manager."""
     base_url = request.host_url.rstrip("/")
     lan_ip = get_lan_ip()
-    return """
+    html = """
     <html>
       <head>
         <title>Fleet Executive Control Panel</title>
@@ -252,19 +294,59 @@ def index():
           img { width: 100%; max-width: 640px; border: 3px solid #ff4444; border-radius: 5px; }
           h1 { color: #ff4444; margin-bottom: 5px; }
           p { color: #aaa; font-size: 14px; }
+                    #alert-banner { display: none; margin: 15px auto; max-width: 640px; padding: 12px 16px; border-radius: 8px; background: #8b0000; color: white; font-weight: bold; }
         </style>
       </head>
       <body>
                 <div class="container">
                     <h1>Fleet AI Remote Telemetry</h1>
                     <p>Live Monitoring Feed (Device: Laptop B Webcam)</p>
-                    <p>Open this on another device: {base_url}</p>
-                    <p>LAN IP: {lan_ip}</p>
+                    <p>Open this on another device: __BASE_URL__</p>
+                    <p>LAN IP: __LAN_IP__</p>
+                                        <div id="alert-banner">Driver distraction detected.</div>
                     <img src="/video_feed" />
                 </div>
+                                <script>
+                                    let previousAlertState = false;
+                                    let notificationPermissionRequested = false;
+
+                                    async function pollAlertStatus() {
+                                        try {
+                                            const response = await fetch('/alert_status', { cache: 'no-store' });
+                                            if (!response.ok) {
+                                                return;
+                                            }
+
+                                            const data = await response.json();
+                                            const banner = document.getElementById('alert-banner');
+                                            banner.style.display = data.alert_active ? 'block' : 'none';
+
+                                            if (!notificationPermissionRequested && 'Notification' in window && Notification.permission === 'default') {
+                                                notificationPermissionRequested = true;
+                                                Notification.requestPermission();
+                                            }
+
+                                            if (data.alert_active && !previousAlertState) {
+                                                if ('Notification' in window && Notification.permission === 'granted') {
+                                                    new Notification('Fleet AI Alert', { body: 'Driver distraction detected on the live feed.' });
+                                                } else {
+                                                    window.alert('Fleet AI Alert: Driver distraction detected on the live feed.');
+                                                }
+                                            }
+
+                                            previousAlertState = data.alert_active;
+                                        } catch (error) {
+                                            console.error('Alert polling failed', error);
+                                        }
+                                    }
+
+                                    pollAlertStatus();
+                                    setInterval(pollAlertStatus, 1000);
+                                </script>
             </body>
         </html>
-        """.format(base_url=base_url, lan_ip=lan_ip)
+        """
+    return html.replace("__BASE_URL__", base_url).replace("__LAN_IP__", lan_ip)
 
 
 if __name__ == '__main__':
