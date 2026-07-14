@@ -52,7 +52,7 @@ def initialize_stream_resources():
     global cap, face_mesh, frame_width, frame_height, fps, frame_buffer, buffer_length, DROWSY_FRAMES_LIMIT, drowsy_counter, alert_active, capture_thread, capture_running
 
     if cap is None:
-        cap = cv2.VideoCapture(1)
+        cap = cv2.VideoCapture(0)
         if not cap.isOpened():
             cap.release()
             cap = None
@@ -191,11 +191,11 @@ def capture_loop():
                     if avg_ear < EAR_THRESHOLD:
                         is_drowsy_this_frame = True
 
-        # Update alert state machine.
-        if is_drowsy_this_frame:
-            drowsy_counter += 1
-        else:
-            drowsy_counter = max(0, drowsy_counter - 1)
+            # Update alert state machine only when analysis runs.
+            if is_drowsy_this_frame:
+                drowsy_counter += 1
+            else:
+                drowsy_counter = max(0, drowsy_counter - 1)
 
         # Trigger cloud save routine if thresholds are breached.
         if drowsy_counter > DROWSY_FRAMES_LIMIT and not alert_active:
