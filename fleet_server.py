@@ -52,7 +52,7 @@ def initialize_stream_resources():
     global cap, face_mesh, frame_width, frame_height, fps, frame_buffer, buffer_length, DROWSY_FRAMES_LIMIT, drowsy_counter, alert_active, capture_thread, capture_running
 
     if cap is None:
-        cap = cv2.VideoCapture(0)
+        cap = cv2.VideoCapture(1)
         if not cap.isOpened():
             cap.release()
             cap = None
